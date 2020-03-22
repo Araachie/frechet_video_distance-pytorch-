@@ -1,5 +1,7 @@
 import numpy as np
-from scipy.linalg import sqrtm
+from scipy import linalg
+from tqdm import tqdm
+
 import torch
 from torch.nn.functional import interpolate
 
@@ -7,7 +9,6 @@ from pytorch_i3d_model.pytorch_i3d import InceptionI3d
 
 
 def preprocess(videos, target_resolution):
-    # n, t, h, w, c -> n, c, t, h, w
     reshaped_videos = videos.permute(0, 4, 1, 2, 3)
     size = [reshaped_videos.size()[2]] + list(target_resolution)
     resized_videos = interpolate(reshaped_videos, size=size, mode='trilinear', align_corners=False)
@@ -16,22 +17,42 @@ def preprocess(videos, target_resolution):
 
 
 def get_statistics(activations):
-    mean = torch.mean(activations, 0)
-    bias = (activations - mean).reshape(activations.size()[0], activations.size()[1], 1)
-    cov = bias.matmul(bias.transpose(1, 2)).mean(0) * bias.size()[0] / (bias.size()[0] - 1)
+    mean = np.mean(activations, axis=0)
+    cov = np.cov(activations, rowvar=False)
     return mean, cov
 
 
-def calculate_fvd_from_activations(first_activations, second_activations):
-    eps = 1e-20
-    f_mu, f_cov = get_statistics(first_activations)
-    s_mu, s_cov = get_statistics(second_activations)
+def calculate_fvd_from_activations(first_activations, second_activations, eps=1e-10):
+    f_mean, f_cov = get_statistics(first_activations)
+    s_mean, s_cov = get_statistics(second_activations)
 
-    mu_dist = torch.norm(f_mu - s_mu).pow(2)
-    matrix = f_cov.matmul(s_cov).detach().numpy()
-    sqrt_matrix = torch.from_numpy(sqrtm(matrix + eps * np.eye(matrix.shape[0])).real).type_as(f_cov)
-    cov_dist = 2. * torch.trace(f_cov + s_cov - 2. * sqrt_matrix)
-    return mu_dist + cov_dist
+    diff = f_mean - s_mean
+
+    sqrt_cov = linalg.sqrtm(f_cov.dot(s_cov))
+    if not np.isfinite(sqrt_cov).all():
+        print("Sqrtm calculation produces singular values;",
+              "adding %s to diagonal of cov estimates." % eps)
+        offset = np.eye(f_cov.shape[0]) * eps
+        sqrt_cov = linalg.sqrtm((f_cov + offset).dot(s_cov + offset))
+    sqrt_cov = sqrt_cov.real
+
+    return diff.dot(diff) + np.trace(f_cov + s_cov - 2 * sqrt_cov)
+
+
+def batch_generator(data, batch_size):
+    n = data.size()[0]
+    indices = np.random.permutation(n)
+
+    for i in tqdm(range(0, n, batch_size)):
+        batch_indices = indices[i:i+batch_size]
+        yield data[batch_indices]
+
+
+def get_activations(data, model, batch_size=10):
+    activations = []
+    for batch in batch_generator(data, batch_size):
+        activations.append(model(batch).squeeze().detach().numpy())
+    return np.vstack(activations)
 
 
 def frechet_video_distance(first_set_of_videos, second_set_of_videos, path_to_model_weights):
@@ -40,7 +61,7 @@ def frechet_video_distance(first_set_of_videos, second_set_of_videos, path_to_mo
     i3d.train(False)
 
     print("Calculating activations for the first set of videos...")
-    first_activations = i3d(preprocess(first_set_of_videos, (224, 224))).squeeze()
+    first_activations = get_activations(preprocess(first_set_of_videos, (224, 224)), i3d)
     print("Calculating activations for the second set of videos...")
-    second_activations = i3d(preprocess(second_set_of_videos, (224, 224))).squeeze()
+    second_activations = get_activations(preprocess(second_set_of_videos, (224, 224)), i3d)
     return calculate_fvd_from_activations(first_activations, second_activations)
